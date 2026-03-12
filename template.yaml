@@ -1,0 +1,288 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: NICE CXone → S3 ingestion (recordings) with Step Functions orchestration, EventBridge schedule, and all dependencies.
+
+Parameters:
+  ScheduleRate:
+    Type: String
+    Default: rate(5 minutes)
+    Description: EventBridge schedule for polling CXone and ingesting recordings.
+
+  WindowMinutes:
+    Type: Number
+    Default: 5
+    Description: Time window (minutes) to look back for completed contacts.
+
+  PlaybackPollWaitSeconds:
+    Type: Number
+    Default: 30
+    Description: Wait between playback URL polls for each contact.
+
+  PlaybackPollMaxAttempts:
+    Type: Number
+    Default: 6
+    Description: Maximum number of polling attempts for playback URL before skipping.
+
+  MapMaxConcurrency:
+    Type: Number
+    Default: 10
+    Description: Max concurrent per-contact processing in the Map state.
+
+  CxoneBaseUrl:
+    Type: String
+    Default: https://<your-cxone-tenant-base>
+    Description: Base URL for CXone APIs (from your DEVone portal).
+
+  CxoneAuthUrl:
+    Type: String
+    Default: https://<your-cxone-auth-base>
+    Description: CXone token endpoint base URL.
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 180
+    MemorySize: 512
+    CodeUri: src/
+    Tracing: Active
+    Environment:
+      Variables:
+        CXONE_BASE_URL: !Ref CxoneBaseUrl
+        CXONE_AUTH_URL: !Ref CxoneAuthUrl
+
+Resources:
+
+  RecordingsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Retain
+
+  ProcessedContactsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: contactId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: contactId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+    DeletionPolicy: Retain
+
+  CxoneSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Store {"accessKeyId":"...","accessKeySecret":"..."}
+      GenerateSecretString:
+        SecretStringTemplate: '{"accessKeyId":"<replace>","accessKeySecret":"<replace>"}'
+        GenerateStringKey: placeholder
+        PasswordLength: 1
+    DeletionPolicy: Retain
+
+  DiscoverCompletedContactsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambda_discover_contacts.lambda_handler
+      Environment:
+        Variables:
+          DDB_TABLE: !Ref ProcessedContactsTable
+          CXONE_SECRET_ID: !Ref CxoneSecret
+          WINDOW_MINUTES: !Ref WindowMinutes
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProcessedContactsTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref CxoneSecret
+        - CloudWatchLogsFullAccess
+
+  GetPlaybackUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambda_get_playback_url.lambda_handler
+      Environment:
+        Variables:
+          CXONE_SECRET_ID: !Ref CxoneSecret
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref CxoneSecret
+        - CloudWatchLogsFullAccess
+
+  DownloadAndUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambda_download_to_s3.lambda_handler
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref RecordingsBucket
+          DDB_TABLE: !Ref ProcessedContactsTable
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref RecordingsBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProcessedContactsTable
+        - CloudWatchLogsFullAccess
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdasFromStateMachine
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt DiscoverCompletedContactsFunction.Arn
+                  - !GetAtt GetPlaybackUrlFunction.Arn
+                  - !GetAtt DownloadAndUploadFunction.Arn
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub "${DiscoverCompletedContactsFunction.Arn}:*"
+                  - !Sub "${GetPlaybackUrlFunction.Arn}:*"
+                  - !Sub "${DownloadAndUploadFunction.Arn}:*"
+
+  IngestCXoneRecordingsStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Type: STANDARD
+      Name: IngestCXoneRecordings
+      Role: !GetAtt StepFunctionsRole.Arn
+
+      DefinitionSubstitutions:
+        DiscoverFnArn: !GetAtt DiscoverCompletedContactsFunction.Arn
+        GetPlaybackFnArn: !GetAtt GetPlaybackUrlFunction.Arn
+        DownloadFnArn: !GetAtt DownloadAndUploadFunction.Arn
+        PollWaitSeconds: !Ref PlaybackPollWaitSeconds
+        PollMaxAttempts: !Ref PlaybackPollMaxAttempts
+        MapConcurrency: !Ref MapMaxConcurrency
+
+      Definition:
+        Comment: "Ingest NICE CXone recordings to S3 with polling for file readiness."
+        StartAt: DiscoverCompletedContacts
+        States:
+          DiscoverCompletedContacts:
+            Type: Task
+            Resource: "${DiscoverFnArn}"
+            ResultPath: "$.discover"
+            Next: AnyContacts
+
+          AnyContacts:
+            Type: Choice
+            Choices:
+              - Variable: "$.discover.contactIds"
+                IsPresent: true
+                Next: ProcessContacts
+            Default: Done
+
+          ProcessContacts:
+            Type: Map
+            ItemsPath: "$.discover.contactIds"
+            MaxConcurrency: ${MapConcurrency}
+            Parameters:
+              "contactId.$": "$$.Map.Item.Value"
+
+            Iterator:
+              StartAt: Init
+              States:
+                Init:
+                  Type: Pass
+                  Result:
+                    retry: 0
+                  ResultPath: "$.meta"
+                  Next: GetPlaybackUrl
+
+                GetPlaybackUrl:
+                  Type: Task
+                  Resource: "${GetPlaybackFnArn}"
+                  Parameters:
+                    "contactId.$": "$.contactId"
+                  ResultPath: "$.playback"
+                  Next: Ready?
+
+                Ready?:
+                  Type: Choice
+                  Choices:
+                    - Variable: "$.playback.ready"
+                      BooleanEquals: true
+                      Next: DownloadAndUpload
+                  Default: WaitThenRetry
+
+                WaitThenRetry:
+                  Type: Wait
+                  Seconds: ${PollWaitSeconds}
+                  Next: IncRetry
+
+                IncRetry:
+                  Type: Pass
+                  Parameters:
+                    "meta":
+                      "retry.$": "States.MathAdd($.meta.retry, 1)"
+                  ResultPath: "$.meta"
+                  Next: GiveUp?
+
+                GiveUp?:
+                  Type: Choice
+                  Choices:
+                    - Variable: "$.meta.retry"
+                      NumericGreaterThanEquals: ${PollMaxAttempts}
+                      Next: SkipContact
+                  Default: GetPlaybackUrl
+
+                DownloadAndUpload:
+                  Type: Task
+                  Resource: "${DownloadFnArn}"
+                  Parameters:
+                    "contactId.$": "$.contactId"
+                    "fileUrl.$": "$.playback.fileUrl"
+                  End: true
+
+                SkipContact:
+                  Type: Pass
+                  Result:
+                    skipped: true
+                  End: true
+
+            Next: Done
+
+          Done:
+            Type: Succeed
+
+      Events:
+        FiveMinuteSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleRate
+            Name: IngestCXoneRecordingsSchedule
+            Description: Poll CXone every X minutes.
+
+Outputs:
+  StateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref IngestCXoneRecordingsStateMachine
+
+  RecordingsBucketName:
+    Description: S3 bucket for raw call recordings
+    Value: !Ref RecordingsBucket
+
+  ProcessedContactsTableName:
+    Description: DynamoDB table used for idempotency
+    Value: !Ref ProcessedContactsTable
+
+  CxoneSecretArn:
+    Description: Secrets Manager secret ARN for CXone credentials
+    Value: !Ref CxoneSecret

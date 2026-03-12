@@ -1,0 +1,18 @@
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.pyc
+
+# SAM/CFN build artifacts
+.aws-sam/
+build/
+
+# OS/editor
+.DS_Store
+.vscode/
+
+# Credentials / local env
+*.env
+.env.*
+# (Never commit secrets)
+EOF
