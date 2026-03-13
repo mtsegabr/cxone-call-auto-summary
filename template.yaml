@@ -40,7 +40,7 @@ Parameters:
 
 Globals:
   Function:
-    Runtime: python3.11
+    Runtime: python3.9
     Timeout: 180
     MemorySize: 512
     CodeUri: src/
