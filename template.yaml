@@ -1,42 +1,47 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: NICE CXone → S3 ingestion (recordings) with Step Functions orchestration, EventBridge schedule, and all dependencies.
+Description: CXone → S3 ingestion (recordings) using SSM Parameter Store for credentials, Step Functions orchestration, and EventBridge schedule.
 
 Parameters:
+  # ---- Scheduling / Flow control knobs ----
   ScheduleRate:
     Type: String
     Default: rate(5 minutes)
     Description: EventBridge schedule for polling CXone and ingesting recordings.
-
   WindowMinutes:
     Type: Number
     Default: 5
     Description: Time window (minutes) to look back for completed contacts.
-
   PlaybackPollWaitSeconds:
     Type: Number
     Default: 30
     Description: Wait between playback URL polls for each contact.
-
   PlaybackPollMaxAttempts:
     Type: Number
     Default: 6
     Description: Maximum number of polling attempts for playback URL before skipping.
-
   MapMaxConcurrency:
     Type: Number
     Default: 10
     Description: Max concurrent per-contact processing in the Map state.
 
+  # ---- CXone endpoints (from your tenant) ----
   CxoneBaseUrl:
     Type: String
-    Default: https://<your-cxone-tenant-base>
-    Description: Base URL for CXone APIs (from your DEVone portal).
-
+    Description: Base URL for CXone APIs (from DEVone portal).
   CxoneAuthUrl:
     Type: String
-    Default: https://<your-cxone-auth-base>
-    Description: CXone token endpoint base URL.
+    Description: Token endpoint base URL for CXone (from DEVone portal).
+
+  # ---- CXone credentials (will be stored in SSM SecureString) ----
+  CxoneAccessKeyId:
+    Type: String
+    NoEcho: true
+    Description: CXone Access Key ID (NoEcho; stored encrypted in SSM Parameter Store).
+  CxoneAccessKeySecret:
+    Type: String
+    NoEcho: true
+    Description: CXone Access Key Secret (NoEcho; stored encrypted in SSM Parameter Store).
 
 Globals:
   Function:
@@ -49,42 +54,49 @@ Globals:
       Variables:
         CXONE_BASE_URL: !Ref CxoneBaseUrl
         CXONE_AUTH_URL: !Ref CxoneAuthUrl
+        # SSM parameter names that Lambdas will read at runtime
+        CXONE_SSM_ACCESS_KEY_ID_PARAM: "/cxone/credentials/accessKeyId"
+        CXONE_SSM_ACCESS_KEY_SECRET_PARAM: "/cxone/credentials/accessKeySecret"
 
 Resources:
-
+  # ---- Storage ----
   RecordingsBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
     DeletionPolicy: Retain
 
   ProcessedContactsTable:
     Type: AWS::DynamoDB::Table
     Properties:
       AttributeDefinitions:
-        - AttributeName: contactId
-          AttributeType: S
+        - { AttributeName: contactId, AttributeType: S }
       KeySchema:
-        - AttributeName: contactId
-          KeyType: HASH
+        - { AttributeName: contactId, KeyType: HASH }
       BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
+      SSESpecification: { SSEEnabled: true }
     DeletionPolicy: Retain
 
-  CxoneSecret:
-    Type: AWS::SecretsManager::Secret
+  # ---- SSM Parameter Store (SecureString) for CXone credentials ----
+  CxoneAccessKeyIdParam:
+    Type: AWS::SSM::Parameter
     Properties:
-      Description: Store {"accessKeyId":"...","accessKeySecret":"..."}
-      GenerateSecretString:
-        SecretStringTemplate: '{"accessKeyId":"<replace>","accessKeySecret":"<replace>"}'
-        GenerateStringKey: placeholder
-        PasswordLength: 1
-    DeletionPolicy: Retain
+      Name: /cxone/credentials/accessKeyId
+      Type: SecureString
+      Tier: Standard
+      Value: !Ref CxoneAccessKeyId
 
+  CxoneAccessKeySecretParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /cxone/credentials/accessKeySecret
+      Type: SecureString
+      Tier: Standard
+      Value: !Ref CxoneAccessKeySecret
+
+  # ---- Lambda: Discover completed contacts ----
   DiscoverCompletedContactsFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -92,27 +104,38 @@ Resources:
       Environment:
         Variables:
           DDB_TABLE: !Ref ProcessedContactsTable
-          CXONE_SECRET_ID: !Ref CxoneSecret
           WINDOW_MINUTES: !Ref WindowMinutes
       Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref ProcessedContactsTable
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref CxoneSecret
+        - DynamoDBCrudPolicy: { TableName: !Ref ProcessedContactsTable }
         - CloudWatchLogsFullAccess
+        # SSM read (SecureString)
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cxone/credentials/accessKeyId
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cxone/credentials/accessKeySecret
 
+  # ---- Lambda: Get playback URL (polls until ready) ----
   GetPlaybackUrlFunction:
     Type: AWS::Serverless::Function
     Properties:
       Handler: lambda_get_playback_url.lambda_handler
-      Environment:
-        Variables:
-          CXONE_SECRET_ID: !Ref CxoneSecret
       Policies:
-        - AWSSecretsManagerGetSecretValuePolicy:
-            SecretArn: !Ref CxoneSecret
         - CloudWatchLogsFullAccess
+        # SSM read (SecureString)
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cxone/credentials/accessKeyId
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cxone/credentials/accessKeySecret
 
+  # ---- Lambda: Download media and upload to S3; mark DDB ----
   DownloadAndUploadFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -122,12 +145,11 @@ Resources:
           S3_BUCKET: !Ref RecordingsBucket
           DDB_TABLE: !Ref ProcessedContactsTable
       Policies:
-        - S3WritePolicy:
-            BucketName: !Ref RecordingsBucket
-        - DynamoDBCrudPolicy:
-            TableName: !Ref ProcessedContactsTable
+        - S3WritePolicy: { BucketName: !Ref RecordingsBucket }
+        - DynamoDBCrudPolicy: { TableName: !Ref ProcessedContactsTable }
         - CloudWatchLogsFullAccess
 
+  # ---- Step Functions execution role ----
   StepFunctionsRole:
     Type: AWS::IAM::Role
     Properties:
@@ -135,8 +157,7 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
-            Principal:
-              Service: states.amazonaws.com
+            Principal: { Service: states.amazonaws.com }
             Action: sts:AssumeRole
       Policies:
         - PolicyName: InvokeLambdasFromStateMachine
@@ -156,13 +177,13 @@ Resources:
                   - !Sub "${GetPlaybackUrlFunction.Arn}:*"
                   - !Sub "${DownloadAndUploadFunction.Arn}:*"
 
+  # ---- Step Functions (Standard) State Machine + EventBridge schedule ----
   IngestCXoneRecordingsStateMachine:
     Type: AWS::Serverless::StateMachine
     Properties:
       Type: STANDARD
       Name: IngestCXoneRecordings
       Role: !GetAtt StepFunctionsRole.Arn
-
       DefinitionSubstitutions:
         DiscoverFnArn: !GetAtt DiscoverCompletedContactsFunction.Arn
         GetPlaybackFnArn: !GetAtt GetPlaybackUrlFunction.Arn
@@ -170,9 +191,8 @@ Resources:
         PollWaitSeconds: !Ref PlaybackPollWaitSeconds
         PollMaxAttempts: !Ref PlaybackPollMaxAttempts
         MapConcurrency: !Ref MapMaxConcurrency
-
       Definition:
-        Comment: "Ingest NICE CXone recordings to S3 with polling for file readiness."
+        Comment: "Ingest NICE CXone recordings to S3 using SSM parameters for credentials."
         StartAt: DiscoverCompletedContacts
         States:
           DiscoverCompletedContacts:
@@ -195,17 +215,14 @@ Resources:
             MaxConcurrency: ${MapConcurrency}
             Parameters:
               "contactId.$": "$$.Map.Item.Value"
-
             Iterator:
               StartAt: Init
               States:
                 Init:
                   Type: Pass
-                  Result:
-                    retry: 0
+                  Result: { retry: 0 }
                   ResultPath: "$.meta"
                   Next: GetPlaybackUrl
-
                 GetPlaybackUrl:
                   Type: Task
                   Resource: "${GetPlaybackFnArn}"
@@ -213,7 +230,6 @@ Resources:
                     "contactId.$": "$.contactId"
                   ResultPath: "$.playback"
                   Next: Ready?
-
                 Ready?:
                   Type: Choice
                   Choices:
@@ -221,12 +237,10 @@ Resources:
                       BooleanEquals: true
                       Next: DownloadAndUpload
                   Default: WaitThenRetry
-
                 WaitThenRetry:
                   Type: Wait
                   Seconds: ${PollWaitSeconds}
                   Next: IncRetry
-
                 IncRetry:
                   Type: Pass
                   Parameters:
@@ -234,7 +248,6 @@ Resources:
                       "retry.$": "States.MathAdd($.meta.retry, 1)"
                   ResultPath: "$.meta"
                   Next: GiveUp?
-
                 GiveUp?:
                   Type: Choice
                   Choices:
@@ -242,7 +255,6 @@ Resources:
                       NumericGreaterThanEquals: ${PollMaxAttempts}
                       Next: SkipContact
                   Default: GetPlaybackUrl
-
                 DownloadAndUpload:
                   Type: Task
                   Resource: "${DownloadFnArn}"
@@ -250,39 +262,36 @@ Resources:
                     "contactId.$": "$.contactId"
                     "fileUrl.$": "$.playback.fileUrl"
                   End: true
-
                 SkipContact:
                   Type: Pass
-                  Result:
-                    skipped: true
+                  Result: { skipped: true }
                   End: true
-
             Next: Done
 
           Done:
             Type: Succeed
 
       Events:
-        FiveMinuteSchedule:
+        IngestionSchedule:
           Type: Schedule
           Properties:
             Schedule: !Ref ScheduleRate
             Name: IngestCXoneRecordingsSchedule
-            Description: Poll CXone every X minutes.
+            Description: Poll CXone periodically for completed contacts.
 
 Outputs:
   StateMachineArn:
     Description: Step Functions State Machine ARN
     Value: !Ref IngestCXoneRecordingsStateMachine
-
   RecordingsBucketName:
     Description: S3 bucket for raw call recordings
     Value: !Ref RecordingsBucket
-
   ProcessedContactsTableName:
-    Description: DynamoDB table used for idempotency
+    Description: DynamoDB idempotency table
     Value: !Ref ProcessedContactsTable
-
-  CxoneSecretArn:
-    Description: Secrets Manager secret ARN for CXone credentials
-    Value: !Ref CxoneSecret
+  CxoneAccessKeyIdParamName:
+    Description: SSM Parameter name for CXone Access Key ID
+    Value: /cxone/credentials/accessKeyId
+  CxoneAccessKeySecretParamName:
+    Description: SSM Parameter name for CXone Access Key Secret
+    Value: /cxone/credentials/accessKeySecret
